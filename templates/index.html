@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <title>gomaild</title>
+    </head>
+    <body>
+        <h1>gomaild</h1>
+        <a href="/connect">Connect</a>
+        <ul>
+            {{range $item := .accounts}}
+            <li>{{ $item.Name }} &lt;{{ $item.Email }}&gt;</li>
+            {{end}}
+        </ul>
+    </body>
+</html>
