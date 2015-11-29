@@ -12,6 +12,7 @@ import (
 
 	"git.notmuchmail.org/git/notmuch.git/bindings/go/src/notmuch"
 	"github.com/mxk/go-imap/imap"
+	"golang.org/x/exp/inotify"
 )
 
 const gmailIMAPAddr = "imap.gmail.com:993"
@@ -127,7 +128,6 @@ func imapLabelsToTags(info *imap.MessageInfo) []string {
 		tags = append(tags, field)
 	}
 
-
 	return tags
 }
 
@@ -203,6 +203,125 @@ func syncMaildirFlags(db *notmuch.Database, message *notmuch.Message, tags map[s
 	return nil
 }
 
+func saveNewMessage(
+	account *Account,
+	resp *imap.Response,
+	uidValidity uint32,
+) error {
+	messageInfo := resp.MessageInfo()
+	uid := messageInfo.UID
+	seen := messageInfo.Flags["\\Seen"]
+
+	var bufSize int
+	for _, literal := range resp.Literals {
+		bufSize += int(literal.Info().Len)
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 0, bufSize))
+	for _, literal := range resp.Literals {
+		if _, err := literal.WriteTo(buf); err != nil {
+			return err
+		}
+	}
+
+	fileName := fmt.Sprintf("%d.%d", uidValidity, uid)
+	tmpName := path.Join(account.Path, "All", "tmp", fileName)
+	f, err := os.Create(tmpName)
+	if err != nil {
+		return err
+	}
+
+	b := buf.Bytes()
+	b = bytes.Replace(b, []byte("\r\n"), []byte("\n"), -1)
+
+	// Add X-Gmail-Message-Id and X-Gmail-Thread-Id special headers.
+	gmailMessageId := messageInfo.Attrs["X-GM-MSGID"].(string)
+	gmailThreadId := messageInfo.Attrs["X-GM-THRID"].(string)
+	headers := fmt.Sprintf(gmailHeaders, gmailMessageId, gmailThreadId)
+	b = bytes.Replace(b, []byte("\n\n"), []byte(headers), 1)
+
+	_, err = f.Write(b)
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	var dst string
+
+	if seen {
+		dst = path.Join(account.Path, "All", "cur", fmt.Sprintf("%s:2,S", fileName))
+	} else {
+		dst = path.Join(account.Path, "All", "new", fileName)
+	}
+
+	os.Rename(tmpName, dst)
+
+	notmuchDb, err := account.OpenNotmuch(false)
+	if err != nil {
+		return err
+	}
+
+	defer notmuchDb.Close()
+
+	notmuchMsg, status := notmuchDb.AddMessage(dst)
+	if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
+		return fmt.Errorf("error adding message to notmuch: %s", status)
+	}
+
+	defer notmuchMsg.Destroy()
+
+	tags := imapLabelsToTags(messageInfo)
+
+	notmuchMsg.Freeze()
+	for _, tag := range tags {
+		notmuchMsg.AddTag(tag)
+	}
+	notmuchMsg.Thaw()
+
+	message := &Message{
+		NotmuchId: notmuchMsg.GetMessageId(),
+		Tags:      tags,
+		UID:       uid,
+	}
+
+	if err = account.UpdateMessage(message); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func handleNewMailEvent(
+	account *Account,
+	c *imap.Client,
+) error {
+	lastSeenUID, err := account.LastSeenUID()
+	if err != nil {
+		return err
+	}
+
+	var seq imap.SeqSet
+	seq.AddRange(lastSeenUID+1, 0)
+
+	cmd, err := c.UIDFetch(&seq, fetchDescriptors...)
+	if err != nil {
+		return err
+	}
+
+	_, err = imap.Wait(cmd, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, resp := range cmd.Data {
+		if err := saveNewMessage(account, resp, c.Mailbox.UIDValidity); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func syncSingleMessage(
 	account *Account,
 	c *imap.Client,
@@ -228,6 +347,11 @@ func syncSingleMessage(
 	notmuchMessage, status := notmuchDb.FindMessage(message.NotmuchId)
 	if status != notmuch.STATUS_SUCCESS {
 		return nil, fmt.Errorf("invlid notmuch status: %s", status)
+	}
+
+	if notmuchMessage.GetMessageId() == "" {
+		notmuchMessage.Destroy()
+		notmuchMessage = nil
 	}
 
 	if notmuchMessage != nil {
@@ -513,7 +637,8 @@ func syncMailOnce(account *Account, accessToken *AccessToken, quitCh chan struct
 		return err
 	}
 
-	c.SetLogMask(imap.LogAll)
+	//c.SetLogMask(imap.LogAll)
+	c.SetLogMask(imap.LogConn | imap.LogState | imap.LogCmd)
 
 	c.CommandConfig["SELECT"].Filter = selectFilter
 	c.CommandConfig["EXAMINE"].Filter = selectFilter
@@ -561,11 +686,11 @@ func syncMailOnce(account *Account, accessToken *AccessToken, quitCh chan struct
 		return errors.New("could not determine the name of All or Trash folder")
 	}
 
-	c.Data = nil
-
 	lastInteraction := time.Now()
 
 	for {
+		c.Data = nil
+
 		if time.Since(lastInteraction) >= time.Minute*5 {
 			return errors.New("imap timeout")
 		}
@@ -684,83 +809,7 @@ func syncMailOnce(account *Account, accessToken *AccessToken, quitCh chan struct
 			}
 
 			for _, resp := range cmd.Data {
-				messageInfo := resp.MessageInfo()
-				uid := messageInfo.UID
-				seen := messageInfo.Flags["\\Seen"]
-
-				var bufSize int
-				for _, literal := range resp.Literals {
-					bufSize += int(literal.Info().Len)
-				}
-
-				buf := bytes.NewBuffer(make([]byte, 0, bufSize))
-				for _, literal := range resp.Literals {
-					if _, err := literal.WriteTo(buf); err != nil {
-						return err
-					}
-				}
-
-				fileName := fmt.Sprintf("%d.%d", c.Mailbox.UIDValidity, uid)
-				tmpName := path.Join(account.Path, "All", "tmp", fileName)
-				f, err := os.Create(tmpName)
-				if err != nil {
-					return err
-				}
-
-				b := buf.Bytes()
-				b = bytes.Replace(b, []byte("\r\n"), []byte("\n"), -1)
-
-				// Add X-Gmail-Message-Id and X-Gmail-Thread-Id special headers.
-				gmailMessageId := messageInfo.Attrs["X-GM-MSGID"].(string)
-				gmailThreadId := messageInfo.Attrs["X-GM-THRID"].(string)
-				headers := fmt.Sprintf(gmailHeaders, gmailMessageId, gmailThreadId)
-				b = bytes.Replace(b, []byte("\n\n"), []byte(headers), 1)
-
-				_, err = f.Write(b)
-				f.Close()
-				if err != nil {
-					return err
-				}
-
-				var dst string
-
-				if seen {
-					dst = path.Join(account.Path, "All", "cur", fmt.Sprintf("%s:2,S", fileName))
-				} else {
-					dst = path.Join(account.Path, "All", "new", fileName)
-				}
-
-				os.Rename(tmpName, dst)
-
-				notmuchDb, err := account.OpenNotmuch(false)
-				if err != nil {
-					return err
-				}
-
-				notmuchMsg, status := notmuchDb.AddMessage(dst)
-				if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-					notmuchDb.Close()
-					return fmt.Errorf("error adding message to notmuch: %s", status)
-				}
-
-				tags := imapLabelsToTags(messageInfo)
-				notmuchMsg.Freeze()
-
-				for _, tag := range tags {
-					notmuchMsg.AddTag(tag)
-				}
-
-				notmuchMsg.Thaw()
-
-				message := &Message{
-					NotmuchId: notmuchMsg.GetMessageId(),
-					Tags:      tags,
-					UID:       uid,
-				}
-
-				notmuchDb.Close()
-
-				if err = account.UpdateMessage(message); err != nil {
+				if err := saveNewMessage(account, resp, c.Mailbox.UIDValidity); err != nil {
 					return err
 				}
 			}
@@ -772,7 +821,17 @@ func syncMailOnce(account *Account, accessToken *AccessToken, quitCh chan struct
 				count = 10
 			}
 
-			// TODO: check if new messages were delivered to the mailbox in the meantime.
+			for _, resp := range c.Data {
+				if resp.Label == "EXISTS" {
+					// New mail arrived in the meantime - fetch it now.
+					if err := handleNewMailEvent(account, c); err != nil {
+						return err
+					}
+					break
+				}
+			}
+
+			c.Data = nil
 		}
 
 		err = syncExistingMessages(account, c, remoteIds, cacheIds, highestModSeq, folderTrash)
@@ -788,15 +847,85 @@ func syncMailOnce(account *Account, accessToken *AccessToken, quitCh chan struct
 
 		c.Data = nil
 
-		if _, err = c.Close(false); err != nil {
+		if _, err := c.Idle(); err != nil {
 			return err
 		}
 
 		lastInteraction = time.Now()
 
-		select {
-		case <-time.After(time.Minute * 4):
-		case <-quitCh:
+		idle := func() (bool, error) {
+			timeoutCh := time.After(time.Minute * 4)
+
+			watcher, err := inotify.NewWatcher()
+			if err != nil {
+				return false, err
+			}
+
+			defer watcher.Close()
+
+			watchPath := path.Join(account.Path, ".notmuch", "xapian", "flintlock")
+			err = watcher.AddWatch(watchPath, inotify.IN_CLOSE_WRITE)
+			if err != nil {
+				return false, err
+			}
+
+		idle:
+			for {
+				select {
+				case <-watcher.Event:
+					imap.Wait(c.IdleTerm())
+					if _, err := imap.Wait(c.Close(false)); err != nil {
+						return false, err
+					}
+					return true, nil
+				case <-timeoutCh:
+					imap.Wait(c.IdleTerm())
+					if _, err := imap.Wait(c.Close(false)); err != nil {
+						return false, err
+					}
+					return true, nil
+				case <-quitCh:
+					imap.Wait(c.IdleTerm())
+					return false, nil
+				default:
+				}
+
+				if err := c.Recv(time.Second); err == nil {
+					imap.Wait(c.IdleTerm())
+
+					for _, resp := range c.Data {
+						if resp.Label == "EXISTS" {
+							// New mail arrived.
+							if err := handleNewMailEvent(account, c); err != nil {
+								return false, err
+							}
+
+							c.Data = nil
+
+							if _, err := c.Idle(); err != nil {
+								return false, err
+							}
+
+							continue idle
+						}
+					}
+
+					c.Data = nil
+
+					if _, err := imap.Wait(c.Close(false)); err != nil {
+						return false, err
+					}
+
+					return true, nil
+				} else if err != imap.ErrTimeout {
+					return false, err
+				}
+			}
+		}
+
+		if cont, err := idle(); err != nil {
+			return err
+		} else if !cont {
 			return nil
 		}
 	}
