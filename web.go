@@ -6,6 +6,7 @@ import (
 
 	"github.com/facebookgo/httpdown"
 	"github.com/gin-gonic/gin"
+	"github.com/miGlanz/gomaild/oauth"
 )
 
 const defaultBind = ":8080"
@@ -19,7 +20,7 @@ func indexHandler(c *gin.Context) {
 }
 
 func oauthInitHandler(c *gin.Context) {
-	c.Redirect(http.StatusFound, GetOAuthUrl())
+	c.Redirect(http.StatusFound, oauth.GetOAuthUrl())
 }
 
 func oauthReturnHandler(c *gin.Context) {
@@ -33,7 +34,7 @@ func oauthReturnHandler(c *gin.Context) {
 		return
 	}
 
-	oauthAccount, err := GetOAuthAccount(code)
+	oauthAccount, err := oauth.GetOAuthAccount(code)
 	if err != nil {
 		c.HTML(http.StatusUnauthorized, "error.html", gin.H{
 			"error": "Could not get OAuth access token.",

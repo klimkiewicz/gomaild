@@ -14,6 +14,8 @@ import (
 
 	"git.notmuchmail.org/git/notmuch.git/bindings/go/src/notmuch"
 	"github.com/boltdb/bolt"
+	"github.com/miGlanz/gomaild/common"
+	"github.com/miGlanz/gomaild/oauth"
 )
 
 const configFileName = "mail.db"
@@ -53,8 +55,8 @@ type Account struct {
 	db *bolt.DB
 }
 
-func (a *Account) GetAllMessageIds() ([]uint32, error) {
-	ids := make([]uint32, 0)
+func (a *Account) GetAllUIDs() (common.UIDSlice, error) {
+	ids := make(common.UIDSlice, 0)
 
 	err := a.db.View(func(tx *bolt.Tx) error {
 		if b := tx.Bucket([]byte(a.Email)); b != nil {
@@ -70,6 +72,7 @@ func (a *Account) GetAllMessageIds() ([]uint32, error) {
 	if err != nil {
 		return nil, err
 	} else {
+		ids.Sort()
 		return ids, nil
 	}
 }
@@ -235,7 +238,7 @@ func OpenConfig(dir string) (*Config, error) {
 	}
 }
 
-func (c *Config) syncAccount(account *Account, accessToken *AccessToken) {
+func (c *Config) syncAccount(account *Account, accessToken *oauth.AccessToken) {
 	// syncAccount expects c.mutex to be locked.
 	quitCh := make(chan struct{}, 1)
 	c.quitChans[account.Email] = quitCh
@@ -258,7 +261,7 @@ func (c *Config) syncAccount(account *Account, accessToken *AccessToken) {
 	}()
 }
 
-func (c *Config) AddAccount(oauthAccount *OAuthAccount) error {
+func (c *Config) AddAccount(oauthAccount *oauth.OAuthAccount) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -385,7 +388,7 @@ func (c *Config) StartSync() error {
 			continue
 		}
 
-		c.syncAccount(account, NewAccessToken(account.RefreshToken))
+		c.syncAccount(account, oauth.NewAccessToken(account.RefreshToken))
 	}
 
 	return nil

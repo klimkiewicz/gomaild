@@ -1,4 +1,4 @@
-package main
+package oauth
 
 import (
 	"encoding/json"
@@ -162,51 +162,3 @@ func refreshAccessToken(refreshToken string) (string, int, error) {
 
 	return info.AccessToken, info.ExpiresIn, nil
 }
-
-//func AccessTokenRefresher(refreshToken string, accessToken *AccessToken, quitCh chan struct{}) <-chan string {
-//	ch := make(chan string)
-//
-//	go func() {
-//		defer close(ch)
-//
-//		for {
-//			if accessToken == nil {
-//				var err error
-//
-//				accessToken, err = refreshAccessToken(refreshToken)
-//
-//				if err != nil {
-//					// Retry with exponential backoff.
-//					waitFor := 500 * time.Millisecond
-//
-//					for err != nil {
-//						waitFor *= 2
-//						if waitFor > time.Minute {
-//							waitFor = time.Minute
-//						}
-//
-//						select {
-//						case <-time.After(waitFor):
-//						case <-quitCh:
-//							return
-//						}
-//
-//						accessToken, err = refreshAccessToken(refreshToken)
-//					}
-//				}
-//
-//				fmt.Println("New access token", accessToken.Token)
-//			}
-//
-//			select {
-//			case ch <- accessToken.Token:
-//			case <-time.After(accessToken.ExpiresIn - 10*time.Second):
-//				accessToken = nil
-//			case <-quitCh:
-//				return
-//			}
-//		}
-//	}()
-//
-//	return ch
-//}
