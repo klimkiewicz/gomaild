@@ -551,14 +551,21 @@ func SyncMail(account *Account, accessToken *oauth.AccessToken, quitCh chan stru
 	// Keep synchronizing and retrying
 	if err := syncMail(account, accessToken, quitCh); err != nil {
 		waitFor := 500 * time.Millisecond
+		lastError := time.Now()
 
 		for err != nil {
-			fmt.Println("ERROR", err)
+			logger.Printf("Error synchronizing mail: %s", err)
 
-			waitFor *= 2
-			if waitFor > time.Minute {
-				waitFor = time.Minute
+			if time.Since(lastError) > time.Second*90 {
+				waitFor = 500 * time.Millisecond
+			} else {
+				waitFor *= 2
+				if waitFor > time.Minute {
+					waitFor = time.Minute
+				}
 			}
+
+			lastError = time.Now()
 
 			select {
 			case <-time.After(waitFor):
