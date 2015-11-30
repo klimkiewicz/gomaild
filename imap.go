@@ -169,6 +169,8 @@ func checkNotmuchFileExists(db *notmuch.Database, message *notmuch.Message) (boo
 		if os.IsNotExist(err) {
 			if status := db.RemoveMessage(fileName); status == notmuch.STATUS_DUPLICATE_MESSAGE_ID {
 				return checkNotmuchFileExists(db, message)
+			} else if status != notmuch.STATUS_SUCCESS {
+				return false, fmt.Errorf("error removing message from notmuch: %s", status)
 			} else {
 				return false, nil
 			}
@@ -494,13 +496,7 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 		return err
 	}
 
-	lastInteraction := time.Now()
-
 	for {
-		if time.Since(lastInteraction) >= time.Minute*5 {
-			return errTimeout
-		}
-
 		select {
 		case <-watcher.Event:
 			return nil

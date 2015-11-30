@@ -2,8 +2,10 @@ package gmail
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,8 @@ X-Gmail-Thread-Id: %s
 
 `
 
+var netTimeout = time.Minute * 5
+
 // Add HIGHESTMODSEQ filter for CONDSTORE extension
 var selectFilter = imap.LabelFilter(
 	"EXISTS",
@@ -61,6 +65,7 @@ var fetchDescriptors = []string{
 }
 
 type Client struct {
+	conn        net.Conn
 	folderAll   string
 	folderTrash string
 	imap        *imap.Client
@@ -129,7 +134,17 @@ func tagsToImapLabels(tags common.TagsSet) []imap.Field {
 }
 
 func Dial(email, accessToken string) (*Client, error) {
-	c, err := imap.DialTLS(gmailIMAPAddr, nil)
+	conn, err := net.DialTimeout("tcp", gmailIMAPAddr, time.Second*30)
+	if err != nil {
+		return nil, err
+	}
+
+	conn.SetDeadline(time.Now().Add(netTimeout))
+
+	host, _, _ := net.SplitHostPort(gmailIMAPAddr)
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
+
+	c, err := imap.NewClient(tlsConn, host, time.Second*30)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +193,7 @@ func Dial(email, accessToken string) (*Client, error) {
 	c.Data = nil
 
 	return &Client{
+		conn:        conn,
 		imap:        c,
 		folderAll:   folderAll,
 		folderTrash: folderTrash,
@@ -186,6 +202,8 @@ func Dial(email, accessToken string) (*Client, error) {
 }
 
 func (c *Client) SelectAll() (*MailboxStatus, error) {
+	c.conn.SetDeadline(time.Now().Add(netTimeout))
+
 	cmd, err := c.imap.Select(c.folderAll, false)
 	if err != nil {
 		return nil, err
@@ -280,6 +298,8 @@ func (c *Client) FetchNewUIDs() (common.UIDSlice, error) {
 }
 
 func (c *Client) FetchMessages(uids common.UIDSlice) ([]*Message, error) {
+	c.conn.SetDeadline(time.Now().Add(netTimeout))
+
 	var seq imap.SeqSet
 	for _, uid := range uids {
 		seq.AddNum(uid)
@@ -421,6 +441,8 @@ func (c *Client) RemoveMessageTags(uid uint32, tags common.TagsSet) error {
 }
 
 func (c *Client) Idle() error {
+	c.conn.SetDeadline(time.Now().Add(netTimeout))
+
 	_, err := c.imap.Idle()
 	return err
 }
