@@ -243,7 +243,7 @@ func (c *Config) syncAccount(account *Account, accessToken *oauth.AccessToken) {
 	quitCh := make(chan struct{}, 1)
 	c.quitChans[account.Email] = quitCh
 
-	c.wg.Add(3)
+	c.wg.Add(4)
 
 	go func() {
 		defer c.wg.Done()
@@ -258,6 +258,11 @@ func (c *Config) syncAccount(account *Account, accessToken *oauth.AccessToken) {
 	go func() {
 		defer c.wg.Done()
 		SyncDrafts(account, accessToken, quitCh)
+	}()
+
+	go func() {
+		defer c.wg.Done()
+		SyncSMTP(account, accessToken, quitCh)
 	}()
 }
 
