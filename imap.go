@@ -162,24 +162,29 @@ func saveMessage(account *Account, mailbox *gmail.MailboxStatus, message *gmail.
 	return nil
 }
 
-func checkNotmuchFileExists(db *notmuch.Database, message *notmuch.Message) (bool, error) {
-	fileName := message.GetFileName()
-
+func checkFileExists(fileName string) (bool, error) {
 	if _, err := os.Stat(fileName); err != nil {
 		if os.IsNotExist(err) {
-			if status := db.RemoveMessage(fileName); status == notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-				return checkNotmuchFileExists(db, message)
-			} else if status != notmuch.STATUS_SUCCESS {
-				return false, fmt.Errorf("error removing message from notmuch: %s", status)
-			} else {
-				return false, nil
-			}
+			return false, nil
 		} else {
 			return false, err
 		}
+	} else {
+		return true, nil
+	}
+}
+
+func removeNotmuchFileName(db *notmuch.Database, message *notmuch.Message, fileName string) error {
+	if status := db.RemoveMessage(fileName); status == notmuch.STATUS_DUPLICATE_MESSAGE_ID {
+		fileName := message.GetFileName()
+		if exists, err := checkFileExists(fileName); err != nil {
+			return err
+		} else if !exists {
+			return removeNotmuchFileName(db, message, fileName)
+		}
 	}
 
-	return true, nil
+	return nil
 }
 
 func getNotmuchMessage(db *notmuch.Database, messageId string) (*notmuch.Message, error) {
@@ -193,16 +198,9 @@ func getNotmuchMessage(db *notmuch.Database, messageId string) (*notmuch.Message
 		return nil, nil
 	}
 
-	if message != nil {
-		if message.GetMessageId() == "" {
-			message.Destroy()
-			message = nil
-		} else if exists, err := checkNotmuchFileExists(db, message); err != nil {
-			return nil, err
-		} else if !exists {
-			message.Destroy()
-			message = nil
-		}
+	if message != nil && message.GetMessageId() == "" {
+		message.Destroy()
+		return nil, nil
 	}
 
 	return message, nil
@@ -231,21 +229,27 @@ func syncExisting(
 	account *Account,
 	c *gmail.Client,
 	remoteIds, cacheIds common.UIDSlice,
+	highestModSeq uint32,
 ) error {
 	// cacheIds are sorted in descending order.
 	lastSeenUID := cacheIds[0]
 
-	remoteTags, err := c.FetchTagChanges(lastSeenUID)
+	remoteTags, err := c.FetchTagChanges(lastSeenUID, highestModSeq)
 	if err != nil {
 		return err
 	}
 
-	notmuchDb, err := account.OpenNotmuch(false)
+	readOnly := len(remoteTags) == 0
+	notmuchDb, err := account.OpenNotmuch(readOnly)
 	if err != nil {
 		return err
 	}
 
-	defer notmuchDb.Close()
+	defer func() {
+		// We use the closure because notmuchDb may change (swtiching from
+		// read-only to read-write).
+		notmuchDb.Close()
+	}()
 
 	deleteRemote := make(common.UIDSlice, 0)
 	deleteCache := make(common.UIDSlice, 0)
@@ -270,6 +274,27 @@ func syncExisting(
 		if err != nil {
 			return err
 		}
+
+		if notmuchMessage != nil {
+			fileName := notmuchMessage.GetFileName()
+
+			if exists, err := checkFileExists(fileName); err != nil {
+				return err
+			} else if !exists {
+				if readOnly {
+					notmuchDb.Close()
+					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
+						return err
+					}
+					readOnly = false
+				}
+
+				if err = removeNotmuchFileName(notmuchDb, notmuchMessage, fileName); err != nil {
+					return err
+				}
+			}
+		}
+
 		localTags := getNotmuchTags(notmuchMessage)
 
 		allTags := make(common.TagsSet)
@@ -281,9 +306,16 @@ func syncExisting(
 			}
 
 			if notmuchMessage != nil {
+				fileName := notmuchMessage.GetFileName()
 				notmuchMessage.Destroy()
 
-				fileName := notmuchMessage.GetFileName()
+				if readOnly {
+					notmuchDb.Close()
+					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
+						return err
+					}
+					readOnly = false
+				}
 
 				status := notmuchDb.RemoveMessage(fileName)
 				if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
@@ -463,9 +495,11 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 	}
 
 	// Sync existing messages.
-	err = syncExisting(account, c, remoteIds, cacheIds)
-	if err != nil {
-		return err
+	if len(cacheIds) > 0 {
+		err = syncExisting(account, c, remoteIds, cacheIds, account.HighestModSeq)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Update account state information.

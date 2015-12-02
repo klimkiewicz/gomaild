@@ -351,12 +351,12 @@ func (c *Client) FetchMessages(uids common.UIDSlice) ([]*Message, error) {
 	return messages, nil
 }
 
-func (c *Client) FetchTagChanges(lastSeenUID uint32) (map[uint32]common.TagsSet, error) {
+func (c *Client) FetchTagChanges(lastSeenUID, highestModSeq uint32) (map[uint32]common.TagsSet, error) {
 	var seq imap.SeqSet
 	seq.AddRange(1, lastSeenUID)
 
 	fields := []imap.Field{"FLAGS", "X-GM-LABELS"}
-	changedSince := []imap.Field{"CHANGEDSINCE", c.mailbox.HighestModSeq}
+	changedSince := []imap.Field{"CHANGEDSINCE", highestModSeq}
 
 	cmd, err := imap.Wait(c.imap.Send("UID FETCH", seq, fields, changedSince))
 	if err != nil {
