@@ -21,12 +21,19 @@ import (
 const configFileName = "mail.db"
 
 var accountsBucket = []byte("accounts")
+var contactsBucket = []byte("contacts")
 
 var ErrAccountDoesntExist = errors.New("account doesn't exist")
 var ErrMessageDoesntExist = errors.New("message doesn't exist")
 
+type Contacts map[string]*Contact
+
+type Contact struct {
+	Title  string   `json:"title"`
+	Emails []string `json:"emails"`
+}
+
 type Message struct {
-	ModSeq    uint32    `json:"mod_seq"`
 	NotmuchId string    `json:"notmuch_id"`
 	Tags      []string  `json:"tags"`
 	UID       uint32    `json:"uid"`
@@ -145,6 +152,46 @@ func (a *Account) UpdateMessage(message *Message) error {
 		}
 
 		return b.Put(key, encoded)
+	})
+}
+
+func (a *Account) GetContacts() (Contacts, error) {
+	var contacts Contacts
+
+	err := a.db.View(func(tx *bolt.Tx) error {
+		contactsBucket := tx.Bucket(contactsBucket)
+		if contactsBucket == nil {
+			return nil
+		}
+
+		encoded := contactsBucket.Get([]byte(a.Email))
+		if encoded == nil {
+			return nil
+		}
+
+		return json.Unmarshal(encoded, &contacts)
+	})
+
+	if err != nil {
+		return nil, err
+	} else {
+		return contacts, nil
+	}
+}
+
+func (a *Account) UpdateContacts(contacts Contacts) error {
+	return a.db.Update(func(tx *bolt.Tx) error {
+		contactsBucket, err := tx.CreateBucketIfNotExists(contactsBucket)
+		if err != nil {
+			return err
+		}
+
+		encoded, err := json.Marshal(contacts)
+		if err != nil {
+			return err
+		}
+
+		return contactsBucket.Put([]byte(a.Email), encoded)
 	})
 }
 
