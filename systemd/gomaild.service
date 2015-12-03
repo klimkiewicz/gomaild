@@ -1,0 +1,13 @@
+[Unit]
+Description=gomaild
+After=network.target
+
+[Service]
+Environment=GIN_MODE=release
+ExecStart=/home/kamil/dev/gomaild/gomaild
+WorkingDirectory=%h/dev/gomaild
+Nice=10
+IOSchedulingClass=3
+
+[Install]
+WantedBy=multi-user.target
