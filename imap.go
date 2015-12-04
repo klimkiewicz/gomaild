@@ -239,7 +239,7 @@ func syncExisting(
 		return err
 	}
 
-	var readOnly bool
+	readOnly := true
 	notmuchDb, err := account.OpenNotmuch(readOnly)
 	if err != nil {
 		return err
@@ -371,11 +371,17 @@ func syncExisting(
 
 			if len(localAddTags) > 0 || len(localRemoveTags) > 0 {
 				if readOnly {
+					notmuchMessage.Destroy()
 					notmuchDb.Close()
 					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
 						return err
 					}
 					readOnly = false
+
+					notmuchMessage, err = getNotmuchMessage(notmuchDb, message.NotmuchId)
+					if err != nil {
+						return err
+					}
 				}
 
 				notmuchMessage.Freeze()
@@ -388,7 +394,9 @@ func syncExisting(
 				notmuchMessage.Thaw()
 			}
 
-			notmuchMessage.Destroy()
+			if notmuchMessage != nil {
+				notmuchMessage.Destroy()
+			}
 
 			if len(remoteAddTags) > 0 {
 				if err := c.AddMessageTags(uid, remoteAddTags); err != nil {
