@@ -451,7 +451,15 @@ func (c *Client) IdleTerm() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	_, err := imap.Wait(c.imap.IdleTerm())
+	cmd, err := c.imap.IdleTerm()
+	if err != nil {
+		return err
+	}
+
+	if cmd != nil {
+		_, err = imap.Wait(cmd, err)
+	}
+
 	return err
 }
 
