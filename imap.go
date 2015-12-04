@@ -239,7 +239,7 @@ func syncExisting(
 		return err
 	}
 
-	readOnly := len(remoteTags) == 0
+	var readOnly bool
 	notmuchDb, err := account.OpenNotmuch(readOnly)
 	if err != nil {
 		return err
@@ -333,9 +333,10 @@ func syncExisting(
 
 			remoteAddTags := make(common.TagsSet)
 			remoteRemoveTags := make(common.TagsSet)
+			localAddTags := make(common.TagsSet)
+			localRemoveTags := make(common.TagsSet)
 
 			fileName := notmuchMessage.GetFileName()
-			notmuchMessage.Freeze()
 
 			for tag, _ := range allTags {
 				inLocal := localTags.Contains(tag)
@@ -359,16 +360,34 @@ func syncExisting(
 				case inLocal == inCache && inCache != inRemote:
 					// remote changed - update notmuch
 					if inRemote {
-						notmuchMessage.AddTag(tag)
+						localAddTags.Add(tag)
 					} else {
-						notmuchMessage.RemoveTag(tag)
+						localRemoveTags.Add(tag)
 					}
 					cacheTags.Set(tag, inRemote)
 					cacheChanged = true
 				}
 			}
 
-			notmuchMessage.Thaw()
+			if len(localAddTags) > 0 || len(localRemoveTags) > 0 {
+				if readOnly {
+					notmuchDb.Close()
+					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
+						return err
+					}
+					readOnly = false
+				}
+
+				notmuchMessage.Freeze()
+				for tag, _ := range localAddTags {
+					notmuchMessage.AddTag(tag)
+				}
+				for tag, _ := range localRemoveTags {
+					notmuchMessage.RemoveTag(tag)
+				}
+				notmuchMessage.Thaw()
+			}
+
 			notmuchMessage.Destroy()
 
 			if len(remoteAddTags) > 0 {
