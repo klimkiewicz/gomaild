@@ -534,7 +534,9 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 
 	defer c.IdleTerm()
 
-	timeoutCh := time.After(time.Minute * 4)
+	syncTimeoutCh := time.After(time.Minute * 10)
+	connTicker := time.NewTicker(time.Minute * 4)
+	defer connTicker.Stop()
 
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
@@ -552,9 +554,27 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 	for {
 		select {
 		case <-watcher.Event:
+			// Wait until we have 30 seconds without inotify events.
+			for {
+				select {
+				case <-time.After(time.Second * 30):
+					return nil
+				case <-watcher.Event:
+				case <-quitCh:
+					return errQuit
+				}
+			}
 			return nil
-		case <-timeoutCh:
+		case <-syncTimeoutCh:
 			return nil
+		case <-connTicker.C:
+			// Send IDLE TERM and IDLE again to keep connection alive.
+			if err := c.IdleTerm(); err != nil {
+				return err
+			}
+			if err := c.Idle(); err != nil {
+				return err
+			}
 		case <-quitCh:
 			return errQuit
 		case err := <-c.IdleWait(time.Second):
