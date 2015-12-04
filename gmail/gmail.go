@@ -117,7 +117,7 @@ func tagsToImapLabels(tags common.TagsSet) []imap.Field {
 		var label string
 
 		switch tag {
-		case "unread":
+		case "unread", "replied":
 			continue
 		case "flagged":
 			label = "\\Starred"
