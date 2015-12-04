@@ -198,11 +198,6 @@ func getNotmuchMessage(db *notmuch.Database, messageId string) (*notmuch.Message
 		return nil, nil
 	}
 
-	if message != nil && message.GetMessageId() == "" {
-		message.Destroy()
-		return nil, nil
-	}
-
 	return message, nil
 }
 
@@ -282,11 +277,16 @@ func syncExisting(
 				return err
 			} else if !exists {
 				if readOnly {
+					notmuchMessage.Destroy()
 					notmuchDb.Close()
 					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
 						return err
 					}
 					readOnly = false
+
+					if notmuchMessage, err = getNotmuchMessage(notmuchDb, message.NotmuchId); err != nil {
+						return err
+					}
 				}
 
 				if err = removeNotmuchFileName(notmuchDb, notmuchMessage, fileName); err != nil {
