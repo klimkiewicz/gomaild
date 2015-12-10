@@ -149,7 +149,6 @@ func syncSMTP(account *Account, accessToken *oauth.AccessToken, quitCh chan stru
 			defer f.Close()
 
 			fileName := f.Name()
-			fmt.Println("fileName", fileName)
 
 			if _, err := io.Copy(f, conn); err != nil {
 				fmt.Println("Couldn't write mail to tmp file:", err)

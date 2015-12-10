@@ -3,9 +3,13 @@ package gmail
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +24,8 @@ const gmailIMAPAddr = "imap.gmail.com:993"
 const messagesPerSearch = 5000
 
 const compressionLevel = 9
+
+const updateTagsUrl = "https://www.googleapis.com/gmail/v1/users/me/messages/%s/modify?"
 
 // Gmail special folder flags
 const (
@@ -64,7 +70,15 @@ var fetchDescriptors = []string{
 	"X-GM-THRID",
 }
 
+var categories = []string{
+	"promotions",
+	"social",
+	"updates",
+	"forums",
+}
+
 type Client struct {
+	accessToken *oauth.AccessToken
 	conn        net.Conn
 	folderAll   string
 	folderTrash string
@@ -81,6 +95,7 @@ type MailboxStatus struct {
 }
 
 type Message struct {
+	ID   string
 	UID  uint32
 	Tags common.TagsSet
 	Body []byte
@@ -93,7 +108,13 @@ func imapLabelsToTags(info *imap.MessageInfo) common.TagsSet {
 		tags.Add("unread")
 	}
 
-	for _, field := range info.Attrs["X-GM-LABELS"].([]imap.Field) {
+	labels, ok := info.Attrs["X-GM-LABELS"].([]imap.Field)
+	if !ok {
+		fmt.Println("MISSING X-GM-LABELS", info)
+		return tags
+	}
+
+	for _, field := range labels {
 		field := field.(string)
 
 		// Handle special labels, such as "\Inbox", "\Important"
@@ -119,6 +140,8 @@ func tagsToImapLabels(tags common.TagsSet) []imap.Field {
 		switch tag {
 		case "unread", "replied":
 			continue
+		case "social", "promotions", "updates", "forums":
+			label = fmt.Sprintf("CATEGORY_%s", strings.ToUpper(tag))
 		case "flagged":
 			label = "\\Starred"
 		case "inbox", "important", "sent":
@@ -133,7 +156,35 @@ func tagsToImapLabels(tags common.TagsSet) []imap.Field {
 	return labels
 }
 
-func Dial(email, accessToken string) (*Client, error) {
+func tagsToApiLabels(tags common.TagsSet) []string {
+	labels := make([]string, 0, len(tags))
+
+	for tag, _ := range tags {
+		var label string
+
+		switch tag {
+		case "replied", "sent":
+			continue
+		case "flagged":
+			label = "STARRED"
+		case "inbox", "unread", "important":
+			label = strings.ToUpper(tag)
+		case "social", "promotions", "updates", "forums":
+			label = fmt.Sprintf("CATEGORY_%s", strings.ToUpper(tag))
+		}
+
+		labels = append(labels, label)
+	}
+
+	return labels
+}
+
+func Dial(email string, accessToken *oauth.AccessToken) (*Client, error) {
+	token, err := accessToken.Get()
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := net.DialTimeout("tcp", gmailIMAPAddr, time.Second*30)
 	if err != nil {
 		return nil, err
@@ -157,7 +208,7 @@ func Dial(email, accessToken string) (*Client, error) {
 	c.Data = nil
 
 	if c.State() == imap.Login {
-		if _, err := c.Auth(oauth.NewXOAuth(email, accessToken)); err != nil {
+		if _, err := c.Auth(oauth.NewXOAuth(email, token)); err != nil {
 			return nil, err
 		}
 	}
@@ -193,6 +244,7 @@ func Dial(email, accessToken string) (*Client, error) {
 	c.Data = nil
 
 	return &Client{
+		accessToken: accessToken,
 		conn:        conn,
 		imap:        c,
 		folderAll:   folderAll,
@@ -203,6 +255,12 @@ func Dial(email, accessToken string) (*Client, error) {
 
 func (c *Client) SelectAll() (*MailboxStatus, error) {
 	c.conn.SetDeadline(time.Now().Add(netTimeout))
+
+	if c.imap.State() == imap.Selected {
+		if _, err := imap.Wait(c.imap.Close(false)); err != nil {
+			return nil, err
+		}
+	}
 
 	cmd, err := c.imap.Select(c.folderAll, false)
 	if err != nil {
@@ -342,6 +400,7 @@ func (c *Client) FetchMessages(uids common.UIDSlice) ([]*Message, error) {
 		body = bytes.Replace(body, []byte("\n\n"), []byte(headers), 1)
 
 		messages = append(messages, &Message{
+			ID:   gmailMessageId,
 			UID:  info.UID,
 			Tags: tags,
 			Body: body,
@@ -438,6 +497,105 @@ func (c *Client) RemoveMessageTags(uid uint32, tags common.TagsSet) error {
 	}
 
 	return nil
+}
+
+func (c *Client) UpdateMessageTags(gmailId string, add, remove common.TagsSet) error {
+	id, err := strconv.ParseUint(gmailId, 10, 64)
+	if err != nil {
+		return err
+	}
+	hexId := strconv.FormatUint(id, 16)
+
+	token, err := c.accessToken.Get()
+	if err != nil {
+		return err
+	}
+
+	values := url.Values{
+		"access_token": {token},
+	}
+	endpoint := fmt.Sprintf(updateTagsUrl, hexId) + values.Encode()
+
+	body := struct {
+		AddLabelIds    []string `json:"addLabelIds,omitempty"`
+		RemoveLabelIds []string `json:"removeLabelIds,omitempty"`
+	}{
+		tagsToApiLabels(add),
+		tagsToApiLabels(remove),
+	}
+	encoded, err := json.Marshal(&body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(encoded))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	var errorResponse struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&errorResponse); err != nil {
+		return err
+	}
+
+	if errorResponse.Error.Message != "" {
+		return fmt.Errorf("Gmail API error: %s", errorResponse.Error.Message)
+	}
+
+	return nil
+}
+
+func (c *Client) GetCategories() (map[uint32]common.TagsSet, error) {
+	cmds := make([]*imap.Command, 0, len(categories))
+
+	for _, category := range categories {
+		query := fmt.Sprintf("category:%s", category)
+		cmd, err := c.imap.UIDSearch("X-GM-RAW", imap.Quote(query, true))
+		if err != nil {
+			return nil, err
+		}
+
+		cmds = append(cmds, cmd)
+	}
+
+	result := make(map[uint32]common.TagsSet)
+
+	for i, cmd := range cmds {
+		cmd, err := imap.Wait(cmd, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, resp := range cmd.Data {
+			for _, uid := range resp.SearchResults() {
+				if tags, ok := result[uid]; ok {
+					tags.Add(categories[i])
+				} else {
+					tags := make(common.TagsSet)
+					tags.Add(categories[i])
+					result[uid] = tags
+				}
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func (c *Client) Idle() error {

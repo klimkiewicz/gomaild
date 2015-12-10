@@ -1,28 +1,26 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"sort"
 	"strings"
 	"time"
 
-	"git.notmuchmail.org/git/notmuch.git/bindings/go/src/notmuch"
 	"github.com/miGlanz/gomaild/common"
 	"github.com/miGlanz/gomaild/gmail"
+	"github.com/miGlanz/gomaild/notmuch"
 	"github.com/miGlanz/gomaild/oauth"
 	"golang.org/x/exp/inotify"
 )
 
 var errQuit = errors.New("quit")
 var errTimeout = errors.New("imap timeout")
-
-var notmuchIgnoredTags = map[string]struct{}{
-	"attachment": {},
-	"signed":     {},
-}
 
 var maildirDirs = []string{
 	"cur", "new", "tmp",
@@ -52,7 +50,7 @@ func tagsToMaildirFlags(tags common.TagsSet) string {
 }
 
 // Make sure the maildir filename is in sync with tags.
-func syncMaildirFlags(db *notmuch.Database, fileName string, tags common.TagsSet) error {
+func syncMaildirFlags(db *notmuch.DB, fileName string, tags common.TagsSet) error {
 	var dst string
 	flags := tagsToMaildirFlags(tags)
 	base := path.Base(fileName)
@@ -85,21 +83,71 @@ func syncMaildirFlags(db *notmuch.Database, fileName string, tags common.TagsSet
 			return err
 		}
 
-		_, status := db.AddMessage(dst)
-		if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-			return fmt.Errorf("Error adding message to notmuch: %s", status)
-		}
-
-		status = db.RemoveMessage(fileName)
-		if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-			return fmt.Errorf("Error removing message from notmuch: %s", status)
+		if err := db.ChangeMessageFileName(fileName, dst); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func saveMessage(account *Account, mailbox *gmail.MailboxStatus, message *gmail.Message) error {
+func bogofilterClassify(account *Account, message *gmail.Message) (common.TagsSet, error) {
+	tagsPath := path.Join(account.Path, ".tags")
+	f, err := os.Open(tagsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		} else {
+			return nil, err
+		}
+	}
+
+	defer f.Close()
+
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, tag := range names {
+		tagPath := path.Join(tagsPath, tag)
+		cmd := exec.Command("bogofilter", "-d", tagPath, "-T")
+		defer cmd.Wait()
+
+		stdIn, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+
+		stdOut, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+
+		if _, err := stdIn.Write(message.Body); err != nil {
+			return nil, err
+		}
+
+		stdIn.Close()
+
+		classification, err := ioutil.ReadAll(stdOut)
+		if err != nil {
+			return nil, err
+		}
+
+		logger.Println("classification", string(classification))
+	}
+
+	return nil, nil
+}
+
+func saveMessage(account *Account, db *notmuch.DB, mailbox *gmail.MailboxStatus, message *gmail.Message) error {
+	bogofilterClassify(account, message)
+
 	// First save the file to tmp dir.
 	fileName := fmt.Sprintf("%d.%d", mailbox.UIDValidity, message.UID)
 	tmpName := path.Join(account.Path, "All", "tmp", fileName)
@@ -129,28 +177,14 @@ func saveMessage(account *Account, mailbox *gmail.MailboxStatus, message *gmail.
 		return err
 	}
 
-	notmuchDb, err := account.OpenNotmuch(false)
+	notmuchId, err := db.AddMessage(dst, message.Tags)
 	if err != nil {
 		return err
 	}
 
-	defer notmuchDb.Close()
-
-	notmuchMsg, status := notmuchDb.AddMessage(dst)
-	if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-		return fmt.Errorf("error adding message to notmuch: %s", status)
-	}
-
-	defer notmuchMsg.Destroy()
-
-	notmuchMsg.Freeze()
-	for tag, _ := range message.Tags {
-		notmuchMsg.AddTag(tag)
-	}
-	notmuchMsg.Thaw()
-
 	cacheMessage := &Message{
-		NotmuchId: notmuchMsg.GetMessageId(),
+		GmailId:   message.ID,
+		NotmuchId: notmuchId,
 		Tags:      message.Tags.Slice(),
 		UID:       message.UID,
 	}
@@ -162,68 +196,12 @@ func saveMessage(account *Account, mailbox *gmail.MailboxStatus, message *gmail.
 	return nil
 }
 
-func checkFileExists(fileName string) (bool, error) {
-	if _, err := os.Stat(fileName); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		} else {
-			return false, err
-		}
-	} else {
-		return true, nil
-	}
-}
-
-func removeNotmuchFileName(db *notmuch.Database, message *notmuch.Message, fileName string) error {
-	if status := db.RemoveMessage(fileName); status == notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-		fileName := message.GetFileName()
-		if exists, err := checkFileExists(fileName); err != nil {
-			return err
-		} else if !exists {
-			return removeNotmuchFileName(db, message, fileName)
-		}
-	}
-
-	return nil
-}
-
-func getNotmuchMessage(db *notmuch.Database, messageId string) (*notmuch.Message, error) {
-	message, status := db.FindMessage(messageId)
-	if status != notmuch.STATUS_SUCCESS {
-		return nil, fmt.Errorf("invlid notmuch status: %s", status)
-	}
-
-	if message.GetMessageId() == "" {
-		message.Destroy()
-		return nil, nil
-	}
-
-	return message, nil
-}
-
-func getNotmuchTags(message *notmuch.Message) common.TagsSet {
-	localTags := make(common.TagsSet)
-
-	if message == nil {
-		localTags.Add("deleted")
-	} else {
-		notmuchTags := message.GetTags()
-		for notmuchTags.Valid() {
-			tag := notmuchTags.Get()
-			if _, ok := notmuchIgnoredTags[tag]; !ok {
-				localTags.Add(tag)
-			}
-			notmuchTags.MoveToNext()
-		}
-	}
-
-	return localTags
-}
-
 func syncExisting(
 	account *Account,
 	c *gmail.Client,
+	db *notmuch.DB,
 	remoteIds, cacheIds common.UIDSlice,
+	categories map[uint32]common.TagsSet,
 	highestModSeq uint32,
 ) error {
 	// cacheIds are sorted in descending order.
@@ -233,18 +211,6 @@ func syncExisting(
 	if err != nil {
 		return err
 	}
-
-	readOnly := true
-	notmuchDb, err := account.OpenNotmuch(readOnly)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		// We use the closure because notmuchDb may change (swtiching from
-		// read-only to read-write).
-		notmuchDb.Close()
-	}()
 
 	deleteRemote := make(common.UIDSlice, 0)
 	deleteCache := make(common.UIDSlice, 0)
@@ -257,45 +223,30 @@ func syncExisting(
 
 		cacheTags := common.TagsSetFromSlice(message.Tags)
 
+		categoryTags, ok := categories[uid]
+		if !ok {
+			categoryTags = make(common.TagsSet)
+		}
+
 		remoteTags, hasRemote := remoteTags[uid]
 		if !remoteIds.Contains(uid) {
 			// Message has been deleted in Gmail.
 			remoteTags = common.TagsSet{"deleted": {}}
 		} else if !hasRemote {
-			remoteTags = cacheTags
+			if len(categoryTags) > 0 {
+				categoryTags.Update(cacheTags)
+				remoteTags = categoryTags
+			} else {
+				remoteTags = cacheTags
+			}
+		} else {
+			remoteTags.Update(categoryTags)
 		}
 
-		notmuchMessage, err := getNotmuchMessage(notmuchDb, message.NotmuchId)
+		localTags, err := db.GetMessageTags(message.NotmuchId)
 		if err != nil {
 			return err
 		}
-
-		if notmuchMessage != nil {
-			fileName := notmuchMessage.GetFileName()
-
-			if exists, err := checkFileExists(fileName); err != nil {
-				return err
-			} else if !exists {
-				if readOnly {
-					notmuchMessage.Destroy()
-					notmuchDb.Close()
-					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
-						return err
-					}
-					readOnly = false
-
-					if notmuchMessage, err = getNotmuchMessage(notmuchDb, message.NotmuchId); err != nil {
-						return err
-					}
-				}
-
-				if err = removeNotmuchFileName(notmuchDb, notmuchMessage, fileName); err != nil {
-					return err
-				}
-			}
-		}
-
-		localTags := getNotmuchTags(notmuchMessage)
 
 		allTags := make(common.TagsSet)
 		allTags.Update(cacheTags, remoteTags, localTags)
@@ -305,26 +256,8 @@ func syncExisting(
 				deleteRemote = append(deleteRemote, uid)
 			}
 
-			if notmuchMessage != nil {
-				fileName := notmuchMessage.GetFileName()
-				notmuchMessage.Destroy()
-
-				if readOnly {
-					notmuchDb.Close()
-					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
-						return err
-					}
-					readOnly = false
-				}
-
-				status := notmuchDb.RemoveMessage(fileName)
-				if status != notmuch.STATUS_SUCCESS && status != notmuch.STATUS_DUPLICATE_MESSAGE_ID {
-					return fmt.Errorf("couldn't remove message from notmuch: %s", status)
-				}
-
-				if err := os.Remove(fileName); err != nil {
-					return err
-				}
+			if err := db.RemoveMessage(message.NotmuchId); err != nil {
+				return err
 			}
 
 			deleteCache = append(deleteCache, uid)
@@ -335,8 +268,6 @@ func syncExisting(
 			remoteRemoveTags := make(common.TagsSet)
 			localAddTags := make(common.TagsSet)
 			localRemoveTags := make(common.TagsSet)
-
-			fileName := notmuchMessage.GetFileName()
 
 			for tag, _ := range allTags {
 				inLocal := localTags.Contains(tag)
@@ -370,48 +301,47 @@ func syncExisting(
 			}
 
 			if len(localAddTags) > 0 || len(localRemoveTags) > 0 {
-				if readOnly {
-					notmuchMessage.Destroy()
-					notmuchDb.Close()
-					if notmuchDb, err = account.OpenNotmuch(false); err != nil {
-						return err
-					}
-					readOnly = false
-
-					notmuchMessage, err = getNotmuchMessage(notmuchDb, message.NotmuchId)
-					if err != nil {
-						return err
-					}
-				}
-
-				notmuchMessage.Freeze()
-				for tag, _ := range localAddTags {
-					notmuchMessage.AddTag(tag)
-				}
-				for tag, _ := range localRemoveTags {
-					notmuchMessage.RemoveTag(tag)
-				}
-				notmuchMessage.Thaw()
-			}
-
-			if notmuchMessage != nil {
-				notmuchMessage.Destroy()
-			}
-
-			if len(remoteAddTags) > 0 {
-				if err := c.AddMessageTags(uid, remoteAddTags); err != nil {
+				if err := db.UpdateTags(message.NotmuchId, localAddTags, localRemoveTags); err != nil {
 					return err
 				}
 			}
 
-			if len(remoteRemoveTags) > 0 {
-				if err := c.RemoveMessageTags(uid, remoteRemoveTags); err != nil {
+			fileName, err := db.GetMessageFileName(message.NotmuchId)
+			if err != nil {
+				return err
+			}
+
+			if len(remoteAddTags) > 0 || len(remoteRemoveTags) > 0 {
+				gmailId := message.GmailId
+
+				if gmailId == "" {
+					f, err := os.Open(fileName)
+					if err != nil {
+						return err
+					}
+
+					defer f.Close()
+
+					scanner := bufio.NewScanner(f)
+					for scanner.Scan() {
+						line := scanner.Text()
+						if strings.HasPrefix(line, "X-Gmail-Message-Id: ") {
+							gmailId = line[len("X-Gmail-Message-Id: "):]
+							message.GmailId = gmailId
+							break
+						}
+					}
+				}
+
+				logger.Printf("Updating Gmail tags for message %s", gmailId)
+
+				if err := c.UpdateMessageTags(gmailId, remoteAddTags, remoteRemoveTags); err != nil {
 					return err
 				}
 			}
 
 			if cacheChanged {
-				if err := syncMaildirFlags(notmuchDb, fileName, cacheTags); err != nil {
+				if err := syncMaildirFlags(db, fileName, cacheTags); err != nil {
 					return err
 				}
 
@@ -444,8 +374,6 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 		return err
 	}
 
-	defer c.Close()
-
 	if mailbox.UIDValidity != account.UIDValidity {
 		// Local cache is invalid - delete.
 		fmt.Println("DIFFERENT UIDVALIDITY")
@@ -466,6 +394,19 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 
 	// Determine which messages are new (are not present in cache).
 	newMessageIds := remoteIds.Diff(cacheIds)
+
+	// Get information about Gmail categories
+	categories, err := c.GetCategories()
+	if err != nil {
+		return err
+	}
+
+	db, err := notmuch.Open(account.Path)
+	if err != nil {
+		return err
+	}
+
+	defer db.Close()
 
 	// Fetch new messages
 	var idx int
@@ -490,7 +431,11 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 		}
 
 		for _, message := range messages {
-			if err := saveMessage(account, mailbox, message); err != nil {
+			if categoryTags, ok := categories[message.UID]; ok {
+				message.Tags.Update(categoryTags)
+			}
+
+			if err := saveMessage(account, db, mailbox, message); err != nil {
 				return err
 			}
 		}
@@ -514,7 +459,7 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 			}
 
 			for _, message := range messages {
-				if err := saveMessage(account, mailbox, message); err != nil {
+				if err := saveMessage(account, db, mailbox, message); err != nil {
 					return err
 				}
 			}
@@ -523,7 +468,7 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 
 	// Sync existing messages.
 	if len(cacheIds) > 0 {
-		err = syncExisting(account, c, remoteIds, cacheIds, account.HighestModSeq)
+		err = syncExisting(account, c, db, remoteIds, cacheIds, categories, account.HighestModSeq)
 		if err != nil {
 			return err
 		}
@@ -535,8 +480,12 @@ func syncMailOnce(account *Account, c *gmail.Client, quitCh <-chan struct{}) err
 	account.LastMailSync = time.Now()
 	account.Save()
 
+	return nil
+}
+
+func idle(account *Account, c *gmail.Client, quitCh <-chan struct{}) error {
 	// IDLE and wait for new messages.
-	if err = c.Idle(); err != nil {
+	if err := c.Idle(); err != nil {
 		return err
 	}
 
@@ -605,12 +554,7 @@ func syncMail(account *Account, accessToken *oauth.AccessToken, quitCh chan stru
 		}
 	}
 
-	token, err := accessToken.Get()
-	if err != nil {
-		return err
-	}
-
-	c, err := gmail.Dial(account.Email, token)
+	c, err := gmail.Dial(account.Email, accessToken)
 	if err != nil {
 		return err
 	}
@@ -619,6 +563,14 @@ func syncMail(account *Account, accessToken *oauth.AccessToken, quitCh chan stru
 
 	for {
 		if err := syncMailOnce(account, c, quitCh); err != nil {
+			if err == errQuit {
+				return nil
+			} else {
+				return err
+			}
+		}
+
+		if err := idle(account, c, quitCh); err != nil {
 			if err == errQuit {
 				return nil
 			} else {

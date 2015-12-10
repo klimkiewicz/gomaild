@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/user"
 	"path"
@@ -12,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"git.notmuchmail.org/git/notmuch.git/bindings/go/src/notmuch"
 	"github.com/boltdb/bolt"
 	"github.com/miGlanz/gomaild/common"
 	"github.com/miGlanz/gomaild/oauth"
@@ -34,6 +32,7 @@ type Contact struct {
 }
 
 type Message struct {
+	GmailId   string    `json:"gmail_id,omitempty"`
 	NotmuchId string    `json:"notmuch_id"`
 	Tags      []string  `json:"tags"`
 	UID       uint32    `json:"uid"`
@@ -213,41 +212,6 @@ func (a *Account) Save() error {
 // Empty local cache (when UIDVALIDITY changes).
 func (a *Account) Empty() error {
 	return nil
-}
-
-func (a *Account) OpenNotmuch(readOnly bool) (*notmuch.Database, error) {
-	notmuchPath := path.Join(a.Path, ".notmuch")
-	_, err := os.Stat(notmuchPath)
-
-	var status notmuch.Status
-	var notmuchDb *notmuch.Database
-
-	if err != nil {
-		if os.IsNotExist(err) {
-			err := os.MkdirAll(a.Path, 0700)
-			if err != nil {
-				return nil, err
-			}
-
-			notmuchDb, status = notmuch.NewDatabase(a.Path)
-		} else {
-			return nil, err
-		}
-	} else {
-		// There is a bug in notmuch.go which assigns 0 to both
-		// DATABASE_MODE_READ_ONLY and DATABASE_MODE_READ_WRITE!
-		var mode notmuch.DatabaseMode
-		if !readOnly {
-			mode = 1
-		}
-		notmuchDb, status = notmuch.OpenDatabase(a.Path, mode)
-	}
-
-	if status != notmuch.STATUS_SUCCESS {
-		return nil, fmt.Errorf("error creating notmuch DB: %s", status)
-	}
-
-	return notmuchDb, nil
 }
 
 type Config struct {
